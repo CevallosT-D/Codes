@@ -1,0 +1,19 @@
+# 1. Load data (VCF/PLINK/numeric matrices)
+library(rMVP)
+geno <- read PedigreeMap("your_data")
+pheno <- read.csv("phenotypes.csv")
+
+# 2. Quality control (MAF>0.05, call rate>0.9)
+geno <- MVP.QC(geno, maf=0.05, callrate=0.9)
+
+# 3. Population structure (PCA/Kmeans)
+pca <- MVP.PCA(geno)
+pop <- MVP.Kmeans(geno)
+
+# 4. Run GWAS (FarmCPU most powerful)
+mvp <- MVP(geno, pheno, pop, method="FarmCPU")
+MVP.Report(mvp, plot.type=c("Manhattan","QQ"))
+
+# 5. Multiple testing correction
+p_threshold <- 0.05 / nrow(mvp$result[[1]])  # Bonferroni
+sig_markers <- mvp$result[[1]][mvp$result[[1]]$P < p_threshold, ]
