@@ -1,0 +1,163 @@
+# =============================================================================
+# COMPREHENSIVE QTL MAPPING TUTORIAL IN R/qtl FOR PLANT BREEDING
+# =============================================================================
+# Goal: Map QTL for a quantitative trait (e.g., yield, height) in RIL population
+# Assumptions: 
+# - Recombinant Inbred Lines (RILs) from biparental cross
+# - SNP markers from GBS/DArT (~5000 markers)
+# - Genetic map in cM
+# - Data files: "genotypes.csv" (markers), "map.csv" (positions), "phenotypes.csv" 
+# Data structure: F2/RILs, 200 individuals, 10 chromosomes, trait "yield"
+# =============================================================================
+
+# STEP 0: INSTALL & LOAD PACKAGES (run once)
+if (!require("qtl")) install.packages("qtl")
+library(qtl)
+if (!require("qtlCharts")) install.packages("qtlCharts")
+library(qtlCharts)
+set.seed(123)  # Reproducibility for simulations
+
+# =============================================================================
+# STEP 1: LOAD DATA - Read cross object (genotypes + map + phenotypes)
+# =============================================================================
+# File format: CSV with markers as columns (AA,AB,BB), rows=individuals
+# Separate map file: marker, chr, pos(cM)
+# Phenotypes: rows=individuals, columns=traits (yield, height, etc.)
+
+cross <- read.cross(
+  format = "csvs",  # CSV for genotypes + separate CSV for phenotypes/map
+  dir    = ".",     # Current folder
+  genfile= "genotypes.csv",    # Columns: ind1_AA, ind1_AB, ..., ind200_BB
+  phefile= "phenotypes.csv",   # Columns: id, yield, height, rep1, rep2,...
+  mapfile= "map.csv"           # Columns: marker, chr, pos
+)
+
+# Check data structure
+summary(cross)         # N ind, markers/chr, missing data %
+plotMap(cross, main="Genetic Map Overview")  # Visualize chromosomes
+
+# =============================================================================
+# STEP 2: DATA CLEANUP - Handle missing data, outliers
+# =============================================================================
+# Calculate genotyping error rate (optional)
+cross <- calc.genoprob(cross, step=1, error.prob=0.001)
+
+# Impute missing genotypes (key for mapping!)
+cross <- fill.geno(cross, method="argmax")  # Most likely genotype
+summary(cross)[["n.gen"]]  # Check imputed %
+
+# Phenotype cleanup: Remove outliers (e.g., >3SD from mean)
+pheno_data <- phenames(cross)  # Trait names
+for (trait in pheno_data) {
+  vals <- as.numeric(pull.pheno(cross, trait))
+  outlier_idx <- which(abs(vals - mean(vals, na.rm=T)) > 3*sd(vals, na.rm=T))
+  if (length(outlier_idx) > 0) {
+    warning(paste("Outliers removed for", trait, ":", length(outlier_idx), "lines"))
+    cross <- dropdups(cross, pheno.col=trait, drop.idx=outlier_idx)
+  }
+}
+
+# =============================================================================
+# STEP 3: GENETIC MAP REFINEMENT - Order markers, estimate distances
+# =============================================================================
+# Check for genotyping errors/segregation distortion
+plotRF(cross)  # Recombination fractions - look for jumps >0.25
+pull.rf(cross)  # Table view
+
+# Re-estimate map with Kosambi (handles double crossovers)
+newmap <- est.map(cross, error.prob=0.001, map.function="kosambi")
+cross <- replace.map(cross, newmap)
+plotMap(cross, main="Refined Genetic Map")
+
+# Drop highly unlinked markers (>50cM or RF>0.3)
+cross <- dropdups(cross)
+cross <- drop.nullmarkers(cross)
+
+# =============================================================================
+# STEP 4: BASIC SINGLE QTL SCAN (Interval Mapping)
+# =============================================================================
+# Calculate genotype probabilities across map (step=2cM for speed)
+cross_prob <- calc.genoprob(cross, step=2, error.prob=0.001)
+
+# Single Marker Scan (quick first pass)
+scan_marker <- scanone(cross_prob, pheno.col="yield", method="mr")  # Haley-Knott
+plot(scan_marker, main="Single Marker Scan - Yield", ylim=c(0,15))
+
+# Interval Mapping (full scan)
+scan_im <- scanone(cross_prob, pheno.col="yield", method="em")  # EM algorithm
+plot(scan_im, main="Interval Mapping - Yield", col="blue")
+
+# =============================================================================
+# STEP 5: PERMUTATION TEST FOR SIGNIFICANCE THRESHOLD
+# =============================================================================
+# Genome-wide LOD threshold (5% significance, 1000 perms)
+lod_threshold <- summary(scan_im, perms=1000, alpha=0.05)
+cat("LOD threshold:", lod_threshold, "\n")
+abline(h=lod_threshold, col="red", lwd=2, lty=2, add=T)  # Add to previous plot
+
+# =============================================================================
+# STEP 6: ADVANCED QTL MAPPING - Composite Interval Mapping (CIM)
+# =============================================================================
+# Control for background markers (improves power)
+scan_cim <- cim(cross_prob, pheno.col="yield", 
+                method="HK",  # Haley-Knott regression
+                n.marcovar=10)  # 10 cofactors (adjust based on genome size)
+
+plot(scan_cim, main="CIM - Yield (10 cofactors)", col="green", add=F)
+summary(scan_cim, threshold=lod_threshold)  # QTL summary table
+
+# Multiple QTL Model (MQM) - stepwise selection
+mf <- mstep(cross_prob, pheno.col="yield", qtl=scan_cim)  # Forward/backward
+cofactors <- makeqtl(cross_prob, chr=mf$chr, pos=mf$pos, what="prob")
+scan_mqm <- mqmscan(cross_prob, pheno.col="yield", cofactors=cofactors)
+plot(scan_mqm, main="MQM - Yield", col="purple")
+
+# =============================================================================
+# STEP 7: MULTI-TRAIT QTL ANALYSIS (if multiple phenotypes)
+# =============================================================================
+if (nphe(cross) > 1) {
+  scan_multi <- scanone(cross_prob, pheno.col=1:nphe(cross), method="em")
+  iplotCurves(scan_multi)  # Interactive LOD curves for traits
+}
+
+# =============================================================================
+# STEP 8: QTL EFFECTS & CONFIDENCE INTERVALS
+# =============================================================================
+# Top QTL summary
+topqtl <- summary(scan_cim, threshold=lod_threshold)
+print(topqtl)  # Chr, pos, LOD, %var explained
+
+# Effect plot for peak QTL
+qtl_peak <- makeqtl(cross_prob, chr=topqtl[1,"chr"], pos=topqtl[1,"pos"], what="prob")
+effectplot(cross_prob, pheno.col="yield", mname.un=qtl_peak, main="QTL Effect Plot")
+
+# LOD support intervals (1.5 LOD drop)
+bayesint(scan_cim, prob=0.95, expandtomarkers=T)  # 95% Bayes CI
+
+# =============================================================================
+# STEP 9: VISUALIZATION & EXPORT
+# =============================================================================
+# LOD profile with thresholds
+plot(scan_cim, main="Final QTL Profile", ylab="LOD Score")
+abline(h=lod_threshold, col="red", lwd=2, lty=2)
+
+# Manhattan-style plot
+plot(scan_cim, main="QTL Manhattan Plot")
+
+# Save results
+write.table(summary(scan_cim), "qtl_results.txt", sep="\t", quote=F)
+save(cross_prob, scan_cim, file="qtl_analysis.RData")
+
+# Interactive HTML plot (qtlCharts)
+iplotLOD(scan_cim)
+
+# =============================================================================
+# STEP 10: INTERPRETATION CHECKLIST
+# =============================================================================
+# - LOD > threshold? Significant QTL
+# - %Var >5%? Biologically relevant
+# - Support interval <20cM? Fine-mapped
+# - Multiple QTL? Check epistasis with stepwise
+# Next: Fine-mapping, validation in NILs, candidate genes via annotation
+
+cat("QTL analysis complete! Check plots and summary(scan_cim).\n")
