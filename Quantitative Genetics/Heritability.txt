@@ -1,0 +1,113 @@
+# =============================================================================
+# HERITABILITY ESTIMATION IN R - PLANT BREEDING EDITION
+# =============================================================================
+# WHAT: Decomposes phenotypic variance into genetic + environmental components
+# WHY: h² = σ²G / σ²P → Tells % trait improvement from selection
+#      Beet yield h²=0.6-0.8 → 60-80% heritable = good GS target!
+# LOOK FOR: High h² (>0.5) = reliable phenotyping; GxE big? = multi-env needed
+# FORMULA: h² = σ²G / (σ²G + σ²GE/n_env + σ²E/reps)
+# =============================================================================
+
+# STEP 1: DATA SIMULATION - BEET YIELD TRIALS ============================
+# WHAT: Multi-environment trial (MET) data: lines x reps x locations
+# WHY: Realistic unbalanced MET (your phenotyping work)
+# LOOK FOR: Sugar yield (t/ha), 3 reps/location, 4 locations
+
+library(lme4); library(lmerTest); library(performance); library(ggplot2)
+set.seed(42)
+
+n_lines <- 150; n_locs <- 4; n_reps <- 3
+data <- expand.grid(Line=paste0("L",1:n_lines), Loc=paste0("Loc",1:n_locs), Rep=1:n_reps)
+
+# Genetic values (lines) + GxE + block + error
+data$Gen <- rnorm(n_lines, 0, 12)[data$Line]  # σG=12 (high heritability)
+data$GxE <- rnorm(n_lines*n_locs, 0, 8)[match(paste(data$Line,data$Loc), 
+                                              paste(rep(paste0("L",1:n_lines),n_locs),
+                                                    rep(paste0("Loc",1:n_locs),each=n_lines)))]  # σGE=8
+data$Block <- rnorm(n_locs*n_reps, 0, 3)[match(paste(data$Loc,data$Rep), 
+                                               paste(rep(paste0("Loc",1:n_locs),n_reps),
+                                                     rep(1:n_reps, n_locs)))]  # σBlock=3
+data$Error <- rnorm(nrow(data), 0, 5)  # σE=5 (plot error)
+
+# Yield phenotype
+data$Yield <- data$Gen + data$GxE + data$Block + data$Error
+
+cat("Data preview (first 10 rows):\n")
+print(head(data,10))
+cat("\nRaw yield stats:\n"); print(summary(data$Yield))
+
+# STEP 2: NARROW-SENSE HERITABILITY (lme4 - BLUP) =======================
+# WHAT: Mixed model partitions variance components (REML)
+# WHY: h² = σ²G / (σ²G + σ²GE/n_loc + σ²E/(n_loc*n_rep))
+# LOOK FOR: High σG vs total → reliable selection
+# MODEL: Yield ~ Line + GxE(Line:Loc) + Block(Loc:Rep)
+
+model <- lmer(Yield ~ 1 + (1|Line) + (1|Line:Loc) + (1|Loc:Rep), data=data, 
+              control=lmerControl(optimizer="bobyqa"))
+summary(model)
+
+# Extract variance components
+vc <- as.data.frame(VarCorr(model))
+cat("\nVARIANCE COMPONENTS:\n")
+print(vc[,c("grp","vcov","sdcor")])
+
+σG <- vc$vcov[vc$grp=="Line"]      # Genetic variance
+σGE <- vc$vcov[vc$grp=="Line:Loc"] # GxE
+σBlock <- vc$vcov[vc$grp=="Loc:Rep"]
+σE <- vc$vcov[vc$grp=="Residual"]
+
+# Heritability on entry-mean basis (genotype means)
+h2 <- σG / (σG + σGE/n_locs + σE/(n_locs*n_reps))
+cat(sprintf("\nNARROW-SENSE h² = %.3f (%.1f%% heritable)\n", h2, h2*100))
+
+# STEP 3: BROAD-SENSE H2 (Genotypes as random - all genetic variance) ====
+# WHAT: H² includes dominance/epistasis (σG_total)
+# WHY: Upper limit of selection response; GS uses this
+model_broad <- lmer(Yield ~ 1 + (1|Line) + (1|Loc) + (1|Loc:Rep), data=data)
+vc_broad <- as.data.frame(VarCorr(model_broad))
+H2 <- vc_broad$vcov[vc_broad$grp=="Line"] / 
+      (vc_broad$vcov[vcov$grp=="Line"] + vc_broad$vcov[vc_broad$grp=="Residual"])
+cat(sprintf("BROAD-SENSE H² = %.3f\n", H2))
+
+# STEP 4: VISUALIZE VARIANCE PARTITION + BLUPs ===========================
+# WHAT: Pie chart + BLUP ranking
+# WHY: Shows dominance of genetic variance; rank lines for selection
+# LOOK FOR: σG >50% total = advance selection
+
+# Variance pie chart
+vars <- c(σG, σGE, σBlock, σE); names(vars) <- c("Genotype", "GxE", "Block", "Error")
+pie(vars/sum(vars), main="Variance Components: Beet Yield MET", col=rainbow(4))
+
+# BLUPs: Best Linear Unbiased Predictors (genetic values)
+blups <- ranef(model)$Line$`(Intercept)`
+blup_df <- data.frame(Line=names(blups), BLUP=blups[order(blups, decreasing=T)])
+print("Top 10 Lines by BLUP (tons/ha):")
+print(head(blup_df,10))
+
+# Selection intensity: Top 10% yield gain
+gain <- mean(blup_df$BLUP[1:round(0.1*n_lines)]) - mean(blup_df$BLUP)
+cat(sprintf("\nExpected gain selecting top 10%%: %.2f t/ha (i=1.75, h²=%.2f)\n", 
+            gain, h2))
+
+ggplot(blup_df[1:20,], aes(x=reorder(Line, BLUP), y=BLUP)) + 
+  geom_col(fill="darkgreen") + coord_flip() +
+  labs(title="Top Beet Lines by BLUP", subtitle=paste("h² =",round(h2,2))) +
+  theme_minimal()
+
+# STEP 5: MULTI-ENVIRONMET HERITABILITY (Genotype-mean basis) ============
+# WHAT: Average across environments (your MET design)
+# WHY: What matters for release: stable performance across locations
+# LOOK FOR: h²>0.5 = reliable variety recommendation
+
+library(agricolae)
+means <- tapply(data$Yield, data$Line, mean)
+h2_mean <- var(means) / (var(means) + var(data$Yield)/n_locs/n_reps)
+cat(sprintf("ENTRY-MEAN h² = %.3f\n", h2_mean))
+
+# =============================================================================
+# INTERPRETATION:
+# h²=0.6-0.8: Excellent for GS! Beet yield typical range
+# GxE large? → Stability analysis (AMMI) next
+# Low h²<0.3: Improve replication/phenotyping
+# USE: Prioritize high-h² traits in breeding index
+# =============================================================================
