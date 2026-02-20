@@ -1,0 +1,336 @@
+# diallel_variance_partition
+#===============================================================================
+# TITLE:
+#   Genetic variance partitioning in plant breeding using mixed models in R
+#   (Additive σ^2_A, Dominance σ^2_D, Epistasis σ^2_AA)
+#   + optional diallel GCA/SCA demonstration
+#
+# WHY THIS SCRIPT EXISTS:
+#   In plant breeding, you often estimate heritability from variance components.
+#   Broad-sense H^2 uses total genetic variance; narrow-sense h^2 uses additive.
+#   To separate additive/dominance/epistasis you need either:
+#     (1) structured mating designs (diallel / NC designs), OR
+#     (2) relationship matrices built from pedigree or markers (genomic models).
+#
+# WHAT YOU GET:
+#   Part A (Genomic variance partition):
+#     - Simulate SNP markers for N individuals
+#     - Build additive (G_A), dominance (G_D), and additive-by-additive (G_AA) kernels
+#     - Simulate phenotype: y = μ + u_A + u_D + u_AA + e
+#     - Fit mixed models with sommer::mmer using those kernels
+#     - Extract σ^2_A, σ^2_D, σ^2_AA, σ^2_E and compute h^2 and H^2
+#
+#   Part B (Diallel illustration):
+#     - Simulate a diallel cross among P parents
+#     - Estimate GCA and SCA by ANOVA as an intuitive bridge
+#
+# IMPORTANT NOTES (READ):
+#   1) In real potato (tetraploid) breeding, dominance/epistasis are more complex.
+#      This script uses a diploid-style genotype coding for clarity.
+#   2) Partitioning σ^2 into A/D/I is model- and coding-dependent.
+#      Different parameterizations exist (orthogonal vs. classical).
+#   3) For field trials (METs), you typically also fit GxE and spatial terms.
+#      This script focuses on the genetic part of the variance.
+#
+# AUTHOR:
+#   Prepared as a teaching / methods script.
+#===============================================================================
+
+#===============================================================================
+# 0. HOUSEKEEPING
+#===============================================================================
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(1)
+
+cat('\n============================================================\n')
+cat(' Genetic variance partitioning demo (A, D, AA)\n')
+cat('============================================================\n\n')
+
+#===============================================================================
+# 1. PACKAGES
+#===============================================================================
+# sommer is used because it supports random effects with user-supplied covariance
+# matrices (kernels) via the "Gu" argument.
+# This is the cleanest way (in R) to estimate σ^2_A, σ^2_D, σ^2_AA separately.
+#
+# If you cannot install packages on your cluster, you can still use this script
+# as a template and replace sommer::mmer with ASReml or other LMM software.
+#===============================================================================
+
+pkg_needed <- c('sommer', 'ggplot2', 'dplyr')
+
+for (p in pkg_needed) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    cat('Installing package: ', p, '\n', sep = '')
+    install.packages(p)
+  }
+}
+
+library(sommer)
+library(ggplot2)
+library(dplyr)
+
+#===============================================================================
+# 2. HELPER FUNCTIONS
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+# 2.1 Genotype simulation
+#-------------------------------------------------------------------------------
+# Simulate a marker matrix M of size N x m with entries {0,1,2}
+# representing AA, Aa, aa (diploid) counts of the reference allele.
+# We draw allele frequencies and then sample genotypes under HWE.
+#-------------------------------------------------------------------------------
+simulate_markers <- function(N, m, maf_min = 0.05, maf_max = 0.5) {
+  p <- runif(m, maf_min, maf_max)           # allele frequency of reference allele
+  M <- matrix(NA_integer_, nrow = N, ncol = m)
+  for (j in 1:m) {
+    # genotype probabilities under HWE
+    probs <- c((1 - p[j])^2, 2*p[j]*(1 - p[j]), p[j]^2)  # counts 0,1,2 of ref allele
+    M[, j] <- sample(x = 0:2, size = N, replace = TRUE, prob = probs)
+  }
+  colnames(M) <- paste0('SNP', seq_len(m))
+  rownames(M) <- paste0('ID',  sprintf('%03d', seq_len(N)))
+  list(M = M, p = p)
+}
+
+#-------------------------------------------------------------------------------
+# 2.2 Additive genomic relationship matrix (VanRaden-like)
+#-------------------------------------------------------------------------------
+# Standard approach:
+#   Z = M - 2p (center)
+#   G = ZZ' / (2 * sum(p(1-p)))
+#-------------------------------------------------------------------------------
+G_additive <- function(M, p) {
+  Z <- sweep(M, 2, 2*p, '-')
+  denom <- 2 * sum(p * (1 - p))
+  G <- tcrossprod(Z) / denom
+  G <- (G + t(G)) / 2
+  rownames(G) <- rownames(M)
+  colnames(G) <- rownames(M)
+  G
+}
+
+#-------------------------------------------------------------------------------
+# 2.3 Dominance genomic relationship matrix
+#-------------------------------------------------------------------------------
+G_dominance <- function(M, p) {
+  N <- nrow(M)
+  m <- ncol(M)
+  D <- matrix(0, nrow = N, ncol = m)
+  for (j in 1:m) {
+    pj <- p[j]
+    D[, j] <- ifelse(M[, j] == 0, -2 * pj^2,
+                     ifelse(M[, j] == 1,  2 * pj * (1 - pj),
+                            -2 * (1 - pj)^2))
+  }
+  denom <- sum((2 * p * (1 - p))^2)
+  G <- tcrossprod(D) / denom
+  G <- (G + t(G)) / 2
+  rownames(G) <- rownames(M)
+  colnames(G) <- rownames(M)
+  G
+}
+
+#-------------------------------------------------------------------------------
+# 2.4 Epistasis kernel (additive-by-additive)
+#-------------------------------------------------------------------------------
+G_epistasis_AA <- function(GA) {
+  GAA <- GA * GA
+  GAA <- (GAA + t(GAA)) / 2
+  GAA
+}
+
+#-------------------------------------------------------------------------------
+# 2.5 Positive definiteness fix (numerical stability)
+#-------------------------------------------------------------------------------
+make_psd <- function(G, eps = 1e-6) {
+  G <- (G + t(G)) / 2
+  diag(G) <- diag(G) + eps
+  G
+}
+
+#-------------------------------------------------------------------------------
+# 2.6 Simulate random effects with covariance
+#-------------------------------------------------------------------------------
+sim_effect <- function(G, sigma2) {
+  G2 <- make_psd(G)
+  L <- chol(G2)
+  z <- rnorm(nrow(G2))
+  u <- as.vector(L %*% z) * sqrt(sigma2)
+  u
+}
+
+#===============================================================================
+# 3. SIMULATE A GENOMIC DATASET
+#===============================================================================
+N <- 300
+m <- 2000
+cat('Simulating markers (N = ', N, ', m = ', m, ')...\n', sep = '')
+mk <- simulate_markers(N = N, m = m)
+M <- mk$M
+p <- mk$p
+
+cat('Building relationship matrices...\n')
+GA  <- make_psd(G_additive(M, p))
+GD  <- make_psd(G_dominance(M, p))
+GAA <- make_psd(G_epistasis_AA(GA))
+
+#===============================================================================
+# 4. SIMULATE PHENOTYPE WITH KNOWN COMPONENTS
+#===============================================================================
+mu <- 30
+sigma2_A  <- 6
+sigma2_D  <- 3
+sigma2_AA <- 2
+sigma2_E  <- 9
+
+cat('Simulating random effects...\n')
+uA  <- sim_effect(GA,  sigma2_A)
+uD  <- sim_effect(GD,  sigma2_D)
+uAA <- sim_effect(GAA, sigma2_AA)
+
+e <- rnorm(N, mean = 0, sd = sqrt(sigma2_E))
+
+y <- mu + uA + uD + uAA + e
+
+pheno <- data.frame(id = rownames(M), y = y)
+
+cat('Phenotype summary:\n')
+print(summary(pheno$y))
+
+#===============================================================================
+# 5. FIT MIXED MODEL (A + D + AA)
+#===============================================================================
+cat('\nFitting model with A + D + AA (sommer::mmer)...\n')
+fit_ADAA <- mmer(
+  fixed  = y ~ 1,
+  random = ~ vsr(id, Gu = GA) + vsr(id, Gu = GD) + vsr(id, Gu = GAA),
+  rcov   = ~ units,
+  data   = pheno,
+  verbose = FALSE
+)
+
+vc <- summary(fit_ADAA)$varcomp
+cat('\nVariance components (estimated):\n')
+print(vc)
+
+# In this script, components appear in model order, then residual last.
+hat_A  <- as.numeric(vc[1, 'VarComp'])
+hat_D  <- as.numeric(vc[2, 'VarComp'])
+hat_AA <- as.numeric(vc[3, 'VarComp'])
+hat_E  <- as.numeric(vc[nrow(vc), 'VarComp'])
+
+VP_hat <- hat_A + hat_D + hat_AA + hat_E
+h2_hat <- hat_A / VP_hat
+H2_hat <- (hat_A + hat_D + hat_AA) / VP_hat
+
+cat('\nEstimated components (true in parentheses):\n')
+cat('  sigma2_A  = ', round(hat_A,  3), ' (', sigma2_A,  ')\n', sep = '')
+cat('  sigma2_D  = ', round(hat_D,  3), ' (', sigma2_D,  ')\n', sep = '')
+cat('  sigma2_AA = ', round(hat_AA, 3), ' (', sigma2_AA, ')\n', sep = '')
+cat('  sigma2_E  = ', round(hat_E,  3), ' (', sigma2_E,  ')\n', sep = '')
+cat('\nHeritabilities:\n')
+cat('  Narrow-sense h2 = ', round(h2_hat, 3), '\n', sep = '')
+cat('  Broad-sense  H2 = ', round(H2_hat, 3), '\n', sep = '')
+
+#===============================================================================
+# 6. BLUPS / RANDOM SOLUTIONS AND PLOTS
+#===============================================================================
+# sommer random solutions are in fit_ADAA$U (list by random term)
+U <- fit_ADAA$U
+
+extract_u <- function(Uobj, k) {
+  uk <- Uobj[[k]]
+  v <- as.numeric(uk[, 1])
+  names(v) <- rownames(uk)
+  v
+}
+
+uA_hat  <- extract_u(U, 1)
+uD_hat  <- extract_u(U, 2)
+uAA_hat <- extract_u(U, 3)
+
+blup_df <- data.frame(
+  id  = names(uA_hat),
+  uA  = as.numeric(uA_hat),
+  uD  = as.numeric(uD_hat),
+  uAA = as.numeric(uAA_hat)
+)
+
+# Save BLUP table for inspection
+write.csv(blup_df, 'blups_A_D_AA.csv', row.names = FALSE)
+cat('\nWrote BLUP table: blups_A_D_AA.csv\n')
+
+# Plot distributions
+p1 <- ggplot(blup_df, aes(x = uA))  + geom_histogram(bins = 30) + ggtitle('Additive BLUP (uA)')
+p2 <- ggplot(blup_df, aes(x = uD))  + geom_histogram(bins = 30) + ggtitle('Dominance BLUP (uD)')
+p3 <- ggplot(blup_df, aes(x = uAA)) + geom_histogram(bins = 30) + ggtitle('Epistasis BLUP (uAA)')
+
+ggsave('hist_uA.png',  p1, width = 7, height = 4)
+ggsave('hist_uD.png',  p2, width = 7, height = 4)
+ggsave('hist_uAA.png', p3, width = 7, height = 4)
+cat('Saved plots: hist_uA.png, hist_uD.png, hist_uAA.png\n')
+
+#===============================================================================
+# 7. ENTRY-MEAN HERITABILITY (IF YOU HAVE r REPS)
+#===============================================================================
+r <- 4
+h2_mean_like <- hat_A / (hat_A + hat_D + hat_AA + hat_E / r)
+cat('\nEntry-mean style h2 (A/(A+D+AA+E/r)) with r = ', r, ': ', round(h2_mean_like, 3), '\n', sep='')
+
+#===============================================================================
+# 8. OPTIONAL: DIALLEL ILLUSTRATION (GCA/SCA)
+#===============================================================================
+cat('\n\n==================== DIALLEL ILLUSTRATION ====================\n')
+
+P <- 8
+par <- LETTERS[1:P]
+reps <- 4
+
+GCA_true <- rnorm(P, 0, 1.2)
+SCA_true <- matrix(rnorm(P*P, 0, 0.8), P, P)
+SCA_true <- (SCA_true + t(SCA_true))/2
+diag(SCA_true) <- 0
+
+diallel <- expand.grid(p1 = par, p2 = par, rep = 1:reps)
+diallel <- diallel %>% filter(p1 != p2)
+
+p1i <- match(diallel$p1, par)
+p2i <- match(diallel$p2, par)
+
+mu_diallel <- 30
+sigma_e_diallel <- 2.0
+
+diallel$y <- mu_diallel + GCA_true[p1i] + GCA_true[p2i] + SCA_true[cbind(p1i, p2i)] +
+  rnorm(nrow(diallel), 0, sigma_e_diallel)
+
+fit_aov <- aov(y ~ p1 + p2 + p1:p2, data = diallel)
+cat('\nDiallel ANOVA table:\n')
+print(summary(fit_aov))
+
+# GCA-like parent means
+cat('\nGCA-like means by parent (as p1 role):\n')
+print(diallel %>% group_by(p1) %>% summarise(mean_y = mean(y), .groups='drop'))
+
+# SCA-like cross deviations
+cross_means <- diallel %>% group_by(p1, p2) %>% summarise(cross_mean = mean(y), .groups='drop')
+parent_means_p1 <- diallel %>% group_by(p1) %>% summarise(p1_mean = mean(y), .groups='drop')
+parent_means_p2 <- diallel %>% group_by(p2) %>% summarise(p2_mean = mean(y), .groups='drop')
+
+cross_means <- cross_means %>%
+  left_join(parent_means_p1, by = 'p1') %>%
+  left_join(parent_means_p2, by = 'p2')
+
+cross_means$expected_add <- (cross_means$p1_mean + cross_means$p2_mean)/2
+cross_means$sca_like <- cross_means$cross_mean - cross_means$expected_add
+
+cat('\nTop 10 SCA-like crosses:\n')
+print(cross_means %>% arrange(desc(sca_like)) %>% head(10))
+
+p_sca <- ggplot(cross_means, aes(x = sca_like)) + geom_histogram(bins = 30) + ggtitle('SCA-like deviations')
+ggsave('hist_sca_like.png', p_sca, width = 7, height = 4)
+cat('Saved plot: hist_sca_like.png\n')
+
+cat('\nAll done.\n')
